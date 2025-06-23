@@ -1,0 +1,178 @@
+import discord
+from discord.ext import tasks, commands
+from discord import app_commands
+import asyncio
+import datetime
+import pytz
+import io
+import os
+import json
+import matplotlib.pyplot as plt
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# --- LOAD CONFIG FROM ENVIRONMENT VARIABLES ---
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID"))
+CHECKIN_CHANNEL_ID = int(os.getenv("CHECKIN_CHANNEL_ID"))
+REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID"))
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME")
+
+# --- SET TIMEZONE ---
+EST = pytz.timezone("US/Eastern")
+DAILY_CHECK_HOUR_EST = 20  # 8 PM EST
+
+# --- FIREBASE SETUP ---
+firebase_key_json = os.getenv("FIREBASE_CRED")
+firebase_key_dict = json.loads(firebase_key_json)
+cred = credentials.Certificate(firebase_key_dict)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# --- DISCORD BOT SETUP ---
+intents = discord.Intents.default()
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- IN-MEMORY TRACKER ---
+pending_level_check = {}
+
+# --- TIME HELPERS ---
+def get_today_date_str():
+    now = datetime.datetime.now(EST)
+    return now.strftime("%Y-%m-%d")
+
+def get_week_dates():
+    start = datetime.datetime.now(EST) - datetime.timedelta(days=datetime.datetime.now(EST).weekday())
+    return [(start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+# --- DISCORD UTIL ---
+def is_admin(member: discord.Member) -> bool:
+    return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
+
+# --- DATA SAVING ---
+async def save_level_entry(user_id: str, username: str, level: int | None):
+    doc_ref = db.collection("level_progress").document(user_id)
+    doc = doc_ref.get()
+    data = doc.to_dict() if doc.exists else {"username": username, "entries": {}}
+    today = get_today_date_str()
+    data["entries"][today] = level if level is not None else -1
+    data["username"] = username
+    doc_ref.set(data)
+
+# --- DAILY CHECK-IN SYSTEM ---
+async def send_checkin(user: discord.User):
+    try:
+        await user.send("🧠 Did your level increase today? Reply with `yes` or `no`.")
+    except Exception as e:
+        print(f"Error sending DM to {user}: {e}")
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    daily_checkin_task.start()
+    weekly_report_task.start()
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    if isinstance(message.channel, discord.DMChannel):
+        user_id = str(message.author.id)
+        content = message.content.strip().lower()
+        if user_id in pending_level_check:
+            state = pending_level_check[user_id]
+            if state == "asked":
+                if content in ["yes", "y"]:
+                    pending_level_check[user_id] = "awaiting"
+                    await message.channel.send("📈 What level are you at now?")
+                elif content in ["no", "n"]:
+                    await save_level_entry(user_id, message.author.name, None)
+                    del pending_level_check[user_id]
+                    await message.channel.send("👍 Noted! No level recorded today.")
+            elif state == "awaiting":
+                if content.isdigit():
+                    level = int(content)
+                    await save_level_entry(user_id, message.author.name, level)
+                    del pending_level_check[user_id]
+                    await message.channel.send(f"✅ Recorded level {level} for today!")
+                else:
+                    await message.channel.send("❌ Please enter a valid number.")
+
+    await bot.process_commands(message)
+
+@tasks.loop(hours=24)
+async def daily_checkin_task():
+    await bot.wait_until_ready()
+    now_est = datetime.datetime.now(EST)
+    if now_est.hour != DAILY_CHECK_HOUR_EST:
+        return
+    guild = bot.get_guild(GUILD_ID)
+    for member in guild.members:
+        if member.bot:
+            continue
+        pending_level_check[str(member.id)] = "asked"
+        await send_checkin(member)
+
+@tasks.loop(hours=168)  # Every 7 days
+async def weekly_report_task():
+    await bot.wait_until_ready()
+    channel = bot.get_channel(REPORT_CHANNEL_ID)
+    if not channel:
+        print("Report channel not found")
+        return
+    docs = db.collection("level_progress").stream()
+    user_data = {}
+    dates = get_week_dates()
+    for doc in docs:
+        d = doc.to_dict()
+        user = d.get("username", "?")
+        entries = d.get("entries", {})
+        levels = [entries.get(date, None if date not in entries else -1) for date in dates]
+        user_data[user] = levels
+    if not user_data:
+        return
+    plt.figure(figsize=(10, 6))
+    for user, levels in user_data.items():
+        y = [float(l) if isinstance(l, int) and l >= 0 else float('nan') for l in levels]
+        plt.plot(dates, y, marker='o', label=user)
+    plt.title("📈 Weekly Level Progression")
+    plt.xlabel("Date")
+    plt.ylabel("Level")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    await channel.send(file=discord.File(buf, filename="weekly_progress.png"))
+
+# --- SLASH COMMAND ---
+@bot.tree.command(name="myprogress", description="Get your weekly level graph")
+async def myprogress(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    doc_ref = db.collection("level_progress").document(user_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        await interaction.response.send_message("No data found.", ephemeral=True)
+        return
+    entries = doc.to_dict().get("entries", {})
+    dates = get_week_dates()
+    levels = [entries.get(date, None if date not in entries else -1) for date in dates]
+    plt.figure(figsize=(8, 5))
+    y = [float(l) if isinstance(l, int) and l >= 0 else float('nan') for l in levels]
+    plt.plot(dates, y, marker='o', label=interaction.user.name)
+    plt.title(f"{interaction.user.name}'s Weekly Progress")
+    plt.xlabel("Date")
+    plt.ylabel("Level")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    await interaction.response.send_message("Sent your progress in DMs!", ephemeral=True)
+    await interaction.user.send(file=discord.File(buf, filename="my_progress.png"))
+
+bot.run(TOKEN)

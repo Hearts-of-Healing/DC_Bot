@@ -1,0 +1,4 @@
+discord.py
+firebase-admin
+matplotlib
+pytz
