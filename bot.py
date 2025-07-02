@@ -160,8 +160,12 @@ def get_all_time_scores():
     for doc in docs:
         d = doc.to_dict() or {}
         username = d.get("username", "?")
-        total = sum(v for v in d.get("entries", {}).values() if isinstance(v, int) and v >= 0)
-        scores.append((username, total))
+        entries = d.get("entries", {})
+        # Get all valid levels and find the maximum
+        valid_levels = [v for v in entries.values() if isinstance(v, int) and v >= 0]
+        if valid_levels:  # Only include users with at least one valid level
+            highest_level = max(valid_levels)
+            scores.append((username, highest_level))
     return sorted(scores, key=lambda x: x[1], reverse=True)
 
 def is_admin(member: discord.Member) -> bool:
@@ -665,7 +669,7 @@ async def motivation(interaction: discord.Interaction):
 @app_commands.choices(filter=[
     app_commands.Choice(name="This Week", value="week"),
     app_commands.Choice(name="This Month", value="month"), 
-    app_commands.Choice(name="All Time", value="alltime")
+    app_commands.Choice(name="All Time (Highest Level)", value="alltime")
 ])
 async def leaderboard(interaction: discord.Interaction, filter: str = "alltime"):
     docs = db.collection("level_progress").stream()
@@ -673,36 +677,54 @@ async def leaderboard(interaction: discord.Interaction, filter: str = "alltime")
     
     if filter == "week":
         dates = get_week_dates()
-        title = "🏆 Weekly Leaderboard"
+        title = "🏆 Weekly Leaderboard (Highest Level This Week)"
     elif filter == "month":
         dates = get_month_dates()
-        title = "🏆 Monthly Leaderboard"
+        title = "🏆 Monthly Leaderboard (Highest Level This Month)"
     else:
         dates = None
-        title = "🏆 All-Time Leaderboard"
+        title = "🏆 All-Time Leaderboard (Highest Level Achieved)"
     
     for doc in docs:
         d = doc.to_dict() or {}
         username = d.get("username", "?")
         entries = d.get("entries", {})
         
-        if dates:  # Week or month filter
-            total = sum(v for k, v in entries.items() if k in dates and isinstance(v, int) and v >= 0)
-        else:  # All time
-            total = sum(v for v in entries.values() if isinstance(v, int) and v >= 0)
-        
-        if total > 0:  # Only include users with progress in the time period
-            scores.append((username, total))
+        if dates:  # For weekly/monthly - get highest in period
+            period_levels = [v for k, v in entries.items() 
+                           if k in dates and isinstance(v, int) and v >= 0]
+            if period_levels:
+                highest = max(period_levels)
+                scores.append((username, highest))
+        else:  # For all-time - get absolute highest
+            all_levels = [v for v in entries.values() 
+                         if isinstance(v, int) and v >= 0]
+            if all_levels:
+                highest = max(all_levels)
+                scores.append((username, highest))
     
     scores.sort(key=lambda x: x[1], reverse=True)
+    
     if not scores:
         await interaction.response.send_message(f"📭 No data found for {filter} period.")
         return
     
-    text = f"**{title}:**\n"
-    for i, (name, score) in enumerate(scores[:10], 1):
-        text += f"`{i:>2}`. **{name}** — `{score}` levels\n"
-    await interaction.response.send_message(text)
+    embed = discord.Embed(title=title, color=0x00ff00)
+    
+    # Top 3 get special medals
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (name, level) in enumerate(scores[:10], 1):
+        if i <= 3:
+            prefix = medals[i-1]
+        else:
+            prefix = f"`{i}.`"
+        embed.add_field(
+            name=f"{prefix} {name}",
+            value=f"Level: {level}",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="levelof", description="Show user's latest level")
 @app_commands.describe(user="User to check")
