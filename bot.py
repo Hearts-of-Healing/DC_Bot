@@ -83,6 +83,8 @@ firebase_key_dict = json.loads(firebase_cred_str)
 cred = credentials.Certificate(firebase_key_dict)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
+# Add this after your other Firebase collection references
+LEADERBOARD_OVERRIDES = db.collection("leaderboard_overrides")
 
 # --- DISCORD BOT ---
 intents = discord.Intents.default()
