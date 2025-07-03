@@ -158,14 +158,24 @@ def get_all_time_scores():
     docs = db.collection("level_progress").stream()
     scores = []
     for doc in docs:
+        user_id = doc.id
         d = doc.to_dict() or {}
         username = d.get("username", "?")
         entries = d.get("entries", {})
-        # Get all valid levels and find the maximum
+        
+        # Check for leaderboard override first
+        override = LEADERBOARD_OVERRIDES.document(user_id).get()
+        if override.exists:
+            override_data = override.to_dict()
+            scores.append((username, override_data["override_level"]))
+            continue
+            
+        # Normal calculation if no override exists
         valid_levels = [v for v in entries.values() if isinstance(v, int) and v >= 0]
-        if valid_levels:  # Only include users with at least one valid level
+        if valid_levels:
             highest_level = max(valid_levels)
             scores.append((username, highest_level))
+    
     return sorted(scores, key=lambda x: x[1], reverse=True)
 
 def is_admin(member: discord.Member) -> bool:
@@ -382,44 +392,33 @@ async def on_message(message: discord.Message):
 @tasks.loop(minutes=10)
 async def daily_checkin_task():
     await bot.wait_until_ready()
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        print("⚠️ Guild not found.")
-        return
-
     now_utc = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
     today_str = get_today_date_str()
 
-    for member in guild.members:
+    for member in bot.get_all_members():
         if member.bot:
             continue
 
         user_id = str(member.id)
+        prefs = db.collection("user_prefs").document(user_id).get().to_dict() or {}
         
-        # Check if user opted out
-        opt_in = await get_opt_in_status(user_id)
-        if not opt_in:
-            continue
+        # Get check-in time settings
+        checkin_prefs = prefs.get("checkin_time", {})
+        tz = pytz.timezone(checkin_prefs.get("timezone", "US/Eastern"))
+        check_hour = checkin_prefs.get("hour", DAILY_CHECK_HOUR_EST)
+        check_minute = checkin_prefs.get("minute", 0)
+        
+        # Check if time matches
+        now_user = now_utc.astimezone(tz)
+        if (now_user.hour == check_hour and 
+            now_user.minute >= check_minute and 
+            now_user.minute < check_minute + 10):
             
-        user_tz = await get_user_timezone(user_id)
-        now_user = now_utc.astimezone(user_tz)
-
-        # Check if current hour matches daily check hour, and minute is within first 10 min
-        if now_user.hour == DAILY_CHECK_HOUR_EST and now_user.minute < 10:
             if last_checkin_sent.get(user_id) == today_str:
-                continue  # Already sent today
+                continue
 
             last_checkin_sent[user_id] = today_str
-
-            # Only send if user didn't already have pending check-in unanswered
-            if user_id not in pending_level_check:
-                try:
-                    pending_level_check[user_id] = "asked"
-                    await send_checkin(member)
-                    print(f"Sent daily check-in to {member.name} at {now_user.isoformat()}")
-                except Exception as e:
-                    print(f"Failed to send DM to {member.name}: {e}")
-
+            await send_checkin(member)
 # --- WEEKLY REPORT LOOP ---
 @tasks.loop(hours=168)
 async def weekly_report_task():
@@ -496,36 +495,228 @@ async def weekly_report_task():
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"🏓 Pong! `{bot.latency * 1000:.2f}ms`")
 
+# Advanced version with pagination
 @bot.tree.command(name="help", description="List of available commands")
 async def help_cmd(interaction: discord.Interaction):
-    text = (
-        "**🔹 General Commands:**\n"
-        "/ping — Check bot latency\n"
-        "/help — Show this help message\n"
-        "/myprogress — Weekly progress graph\n"
-        "/mystats — Show your stats and streak\n"
-        "/myrank — See your leaderboard rank\n"
-        "/leaderboard — Top 10 levelers (with filters)\n"
-        "/levelof [user] — View latest level\n"
-        "/checkin — DM check-in prompt\n"
-        "/nextcheckin — When next check-in is scheduled\n"
-        "/optin — Enable daily DM check-ins\n"
-        "/optout — Disable daily DM check-ins\n"
-        "/settimezone — Set your timezone\n"
-        "/dailyfact — Get a random fun fact\n"
-        "/motivation — Get a motivational quote\n"
-        "\n**🔸 Admin Commands:**\n"
-        "/setlevel — Set user's level\n"
-        "/resetuser — Reset user's data\n"
-        "/announce — Post announcement\n"
-        "/forcesync — Sync commands\n"
-        "/warnings — Log user warnings\n"
-        "/viewwarnings — View user warnings\n"
-        "/clearwarnings — Clear user warnings\n"
-        "/shoutout — Give user shoutout\n"
-        "/syncroles — Sync all user roles"
+    # Page 1: General Commands
+    general = discord.Embed(
+        title="🧠 BrainBot Help - General Commands",
+        color=0x3498db,
+        description="Commands available to all users"
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    general.add_field(
+        name="📊 Progress Tracking",
+        value=(
+            "`/myprogress` - Your weekly level graph\n"
+            "`/mystats` - Your stats & streak\n"
+            "`/myrank` - Your leaderboard position\n"
+            "`/leaderboard` - Top performers"
+        ),
+        inline=False
+    )
+    general.add_field(
+        name="⏰ Check-In System",
+        value=(
+            "`/checkin` - Manual check-in prompt\n"
+            "`/nextcheckin` - View your next check-in\n"
+            "`/mychackintime` - Set your check-in time\n"
+            "`/optin/out` - Toggle daily reminders"
+        ),
+        inline=False
+    )
+    general.add_field(
+        name="⚙️ Preferences",
+        value=(
+            "`/settimezone` - Set your timezone\n"
+            "`/motivation` - Get inspired\n"
+            "`/dailyfact` - Learn something new"
+        ),
+        inline=False
+    )
+
+    # Page 2: Admin Commands
+    admin = discord.Embed(
+        title=f"🛠️ BrainBot Help - Admin Commands",
+        color=0xe74c3c,
+        description=f"Available to: {', '.join(ADMIN_ROLES) or 'Administrators'}"
+    )
+    admin.add_field(
+        name="📈 Level Management",
+        value=(
+            "`/setlevel` - Set user's current level\n"
+            "`/leaderboardoverride` - Adjust LB display\n"
+            "`/viewoverrides` - View active overrides\n"
+            "`/clearoverride` - Remove an override"
+        ),
+        inline=False
+    )
+    admin.add_field(
+        name="🕒 Check-In Control",
+        value=(
+            "`/setchackintime` - Force-set check-in times\n"
+            "`/syncroles` - Update level roles\n"
+            "`/resetuser` - Wipe user data"
+        ),
+        inline=False
+    )
+    admin.add_field(
+        name="⚖️ Moderation",
+        value=(
+            "`/warnings` - Issue warnings\n"
+            "`/viewwarnings` - Check warnings\n"
+            "`/clearwarnings` - Remove warnings\n"
+            "`/announce` - Server announcements"
+        ),
+        inline=False
+    )
+
+    # Page 3: Utility Commands
+    utility = discord.Embed(
+        title="🔧 BrainBot Help - Utility Commands",
+        color=0x2ecc71
+    )
+    utility.add_field(
+        name="Bot Control",
+        value=(
+            "`/ping` - Check bot latency\n"
+            "`/forcesync` - Refresh commands\n"
+            "`/shoutout` - Highlight a user"
+        ),
+        inline=False
+    )
+    utility.add_field(
+        name="Need Help?",
+        value="Contact server staff for assistance",
+        inline=False
+    )
+    utility.set_footer(text=f"Bot Version: {datetime.date.today().isoformat()}")
+
+    # Send with navigation buttons
+    class HelpView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.current_page = 0
+            self.pages = [general, admin, utility]
+            
+        @discord.ui.button(label="◀️", style=discord.ButtonStyle.grey)
+        async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.current_page = (self.current_page - 1) % len(self.pages)
+            await interaction.response.edit_message(embed=self.pages[self.current_page])
+            
+        @discord.ui.button(label="▶️", style=discord.ButtonStyle.grey)
+        async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.current_page = (self.current_page + 1) % len(self.pages)
+            await interaction.response.edit_message(embed=self.pages[self.current_page])
+
+    await interaction.response.send_message(
+        embed=general,
+        view=HelpView(),
+        ephemeral=True
+    )
+
+@bot.tree.command(name="log", description="Admin: View audit log of changes")
+@is_admin_role()
+@app_commands.describe(
+    user_filter="Filter by specific user (optional)",
+    action_filter="Filter by action type (optional)"
+)
+@app_commands.choices(action_filter=[
+    app_commands.Choice(name="Level Change", value="level"),
+    app_commands.Choice(name="Check-in Time", value="checkin"),
+    app_commands.Choice(name="Warning", value="warning"),
+    app_commands.Choice(name="Override", value="override")
+])
+async def view_log(
+    interaction: discord.Interaction,
+    user_filter: Optional[discord.User] = None,
+    action_filter: Optional[str] = None
+):
+    """View paginated audit log with filters"""
+    await interaction.response.defer(ephemeral=True)
+    
+    # Query logs with filters
+    query = db.collection("audit_log").order_by("timestamp", direction=firestore.Query.DESCENDING)
+    
+    if user_filter:
+        query = query.where("user_id", "==", str(user_filter.id))
+    if action_filter:
+        query = query.where("action_type", "==", action_filter)
+    
+    logs = [doc.to_dict() for doc in query.stream()]
+    
+    if not logs:
+        await interaction.followup.send("📭 No log entries found matching your criteria.", ephemeral=True)
+        return
+    
+    # Split logs into pages (5 entries per page)
+    pages = []
+    for i in range(0, len(logs), 5):
+        page_logs = logs[i:i+5]
+        embed = discord.Embed(
+            title="📜 Audit Log",
+            color=0x7289da,
+            description=f"Showing {len(logs)} total entries"
+        )
+        
+        for log in page_logs:
+            timestamp = log.get("timestamp", "Unknown")
+            action = log.get("action", "Unknown action")
+            admin = log.get("admin", "System")
+            target = f"<@{log.get('user_id')}>" if log.get("user_id") else "N/A"
+            
+            embed.add_field(
+                name=f"🕒 {timestamp[:16]}",
+                value=(
+                    f"**Action:** {action}\n"
+                    f"**Target:** {target}\n"
+                    f"**By:** {admin}\n"
+                    f"**Type:** {log.get('action_type', 'N/A')}"
+                ),
+                inline=False
+            )
+        
+        pages.append(embed)
+    
+    # Pagination view
+    class LogView(discord.ui.View):
+        def __init__(self, pages: list):
+            super().__init__(timeout=120)
+            self.pages = pages
+            self.current_page = 0
+            self.update_buttons()
+        
+        def update_buttons(self):
+            self.prev_page.disabled = self.current_page == 0
+            self.next_page.disabled = self.current_page == len(self.pages) - 1
+        
+        @discord.ui.button(label="◀️", style=discord.ButtonStyle.blurple)
+        async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.current_page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.pages[self.current_page],
+                view=self
+            )
+        
+        @discord.ui.button(label="▶️", style=discord.ButtonStyle.blurple)
+        async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.current_page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.pages[self.current_page],
+                view=self
+            )
+        
+        @discord.ui.button(label="🗑️", style=discord.ButtonStyle.red)
+        async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.defer()
+            await interaction.delete_original_response()
+    
+    await interaction.followup.send(
+        embed=pages[0],
+        view=LogView(pages),
+        ephemeral=True
+    )
 
 @bot.tree.command(name="myprogress", description="Show your weekly level graph")
 async def myprogress(interaction: discord.Interaction):
@@ -839,6 +1030,174 @@ async def shoutout(interaction: discord.Interaction, user: discord.Member, messa
         await interaction.response.send_message(f"✅ Shoutout sent for {user.mention}!", ephemeral=True)
     else:
         await interaction.response.send_message("❌ Channel not found.", ephemeral=True)
+
+@bot.tree.command(name="leaderboardoverride", description="Admin: Set leaderboard-specific level without affecting actual progress")
+@is_admin_role()
+@app_commands.describe(
+    user="User to modify",
+    leaderboard_level="Level to show on leaderboards",
+    reason="Reason for override (visible to admins)"
+)
+async def leaderboard_override(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    leaderboard_level: int,
+    reason: str
+):
+    """Sets a special leaderboard value that overrides the calculated highest level"""
+    if leaderboard_level < 0:
+        await interaction.response.send_message("❌ Level cannot be negative", ephemeral=True)
+        return
+
+    # Store the override
+    LEADERBOARD_OVERRIDES.document(str(user.id)).set({
+        "username": user.name,
+        "override_level": leaderboard_level,
+        "reason": reason,
+        "admin": interaction.user.name,
+        "timestamp": datetime.datetime.now(EST).isoformat()
+    })
+
+    await interaction.response.send_message(
+        f"✅ Leaderboard override set for {user.mention}\n"
+        f"📊 New leaderboard level: {leaderboard_level}\n"
+        f"📝 Reason: {reason}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="viewoverrides", description="Admin: View all leaderboard overrides")
+@is_admin_role()
+async def view_overrides(interaction: discord.Interaction):
+    """Lists all active leaderboard overrides"""
+    overrides = LEADERBOARD_OVERRIDES.stream()
+    
+    embed = discord.Embed(
+        title="🏆 Active Leaderboard Overrides",
+        color=discord.Color.orange()
+    )
+    
+    for override in overrides:
+        data = override.to_dict()
+        embed.add_field(
+            name=f"👤 {data['username']}",
+            value=(
+                f"📊 Level: {data['override_level']}\n"
+                f"📝 Reason: {data['reason']}\n"
+                f"🛠️ By: {data['admin']}\n"
+                f"⏰ {data['timestamp'][:10]}"
+            ),
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="clearoverride", description="Admin: Remove a leaderboard override")
+@is_admin_role()
+@app_commands.describe(user="User to clear override for")
+async def clear_override(interaction: discord.Interaction, user: discord.Member):
+    """Removes a leaderboard override, reverting to actual levels"""
+    LEADERBOARD_OVERRIDES.document(str(user.id)).delete()
+    await interaction.response.send_message(
+        f"✅ Removed leaderboard override for {user.mention}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="mychackintime", description="Set your preferred check-in time")
+@app_commands.describe(
+    hour="Hour (0-23) in YOUR timezone",
+    minute="Minute (0-59) [default: 0]"
+)
+async def set_my_checkin_time(
+    interaction: discord.Interaction,
+    hour: app_commands.Range[int, 0, 23],
+    minute: app_commands.Range[int, 0, 59] = 0
+):
+    """Allows users to set their personal check-in time"""
+    user_id = str(interaction.user.id)
+    user_tz = await get_user_timezone(user_id)
+    
+    # Validate time
+    try:
+        test_time = datetime.time(hour, minute)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ Invalid time: {e}",
+            ephemeral=True
+        )
+        return
+    
+    # Save preference
+    db.collection("user_prefs").document(user_id).set({
+        "checkin_time": {
+            "hour": hour,
+            "minute": minute,
+            "timezone": str(user_tz)  # Store for admin reference
+        }
+    }, merge=True)
+    
+    await interaction.response.send_message(
+        f"✅ Your daily check-in time set to {hour:02d}:{minute:02d} {user_tz}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="setchackintime", description="Admin: Set check-in time for any user")
+@is_admin_role()
+@app_commands.describe(
+    user="User to modify",
+    hour="Hour (0-23)",
+    minute="Minute (0-59) [default: 0]",
+    timezone="Timezone (e.g. 'US/Eastern') [default: user's current]"
+)
+async def set_checkin_time_admin(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    hour: app_commands.Range[int, 0, 23],
+    minute: app_commands.Range[int, 0, 59] = 0,
+    timezone: Optional[str] = None
+):
+    """Admin command to override check-in times"""
+    user_id = str(user.id)
+    
+    # Get or validate timezone
+    tz = None
+    if timezone:
+        try:
+            tz = pytz.timezone(timezone)
+        except pytz.UnknownTimeZoneError:
+            await interaction.response.send_message(
+                "❌ Invalid timezone. Use format like 'US/Eastern'",
+                ephemeral=True
+            )
+            return
+    else:
+        tz = await get_user_timezone(user_id)
+    
+    # Validate time
+    try:
+        test_time = datetime.time(hour, minute)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ Invalid time: {e}",
+            ephemeral=True
+        )
+        return
+    
+    # Save preference
+    db.collection("user_prefs").document(user_id).set({
+        "checkin_time": {
+            "hour": hour,
+            "minute": minute,
+            "timezone": str(tz),
+            "admin_override": True,
+            "set_by_admin": interaction.user.name
+        }
+    }, merge=True)
+    
+    await interaction.response.send_message(
+        f"✅ {user.mention}'s check-in time set to {hour:02d}:{minute:02d} {tz}\n"
+        f"⚠️ Admin override active",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="syncroles", description="Admin: Sync all user roles based on their current levels")
 @is_admin_role()
